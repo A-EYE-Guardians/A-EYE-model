@@ -2,3 +2,11 @@ venv
 _segments
 _vda_out
 calib
+
+.env
+__pycache__/
+*.pyc
+*.zip
+minio-data/
+.DS_Store
+node_modules/
