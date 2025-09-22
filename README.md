@@ -154,3 +154,11 @@ python .\ver2_gaze_yolo_fusion.py `
   - 실내 근거리 테스트면 0.10 정도로 완화 가능
 
 > 콘솔의 fix: rejected (res>…, R<…) 메시지로 어떤 조건에 걸리는지 바로 확인 가능.
+
+### 4. STT 호스트 포워더 실행
+
+- cd C:\Gukbi\Direct_RP_CV\stt_host
+- pip install websockets sounddevice (최초 한번)
+- python audio_forwarder.py --ws ws://127.0.0.1:8000/stream --mic 4
+
+“헤이 류지” → wake_detected → 말하고 멈춤 → result: ... → wake_resumed

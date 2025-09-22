@@ -9,7 +9,6 @@ FRAME_SMP   = SAMPLE_RATE * FRAME_MS // 1000  # 320 samples
 
 async def stream(uri: str, device_index: int | None):
     async with websockets.connect(uri, ping_interval=20, max_size=None) as ws:
-        # 서버 연결 및 wake 모드 진입
         print("[host] connect:", uri)
         await ws.send("wake_on")
 
@@ -18,13 +17,14 @@ async def stream(uri: str, device_index: int | None):
         def cb(indata, frames, time_info, status):
             if status:
                 print("[audio]", status)
-            q.put_nowait(indata.copy().tobytes())  # int16 bytes
+            # int16 bytes
+            q.put_nowait(indata.copy().tobytes())
 
         print(f"[host] capturing mic device={device_index} @16kHz mono int16")
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
                             blocksize=FRAME_SMP, device=device_index, callback=cb):
             while True:
-                # 서버 이벤트 수신과 오디오 전송을 동시에 처리
+                # 서버 이벤트 수신과 오디오 전송 동시 처리
                 recv_task = asyncio.create_task(ws.recv())
                 send_task = asyncio.create_task(q.get())
                 done, pending = await asyncio.wait(
@@ -34,20 +34,27 @@ async def stream(uri: str, device_index: int | None):
                 if recv_task in done:
                     msg = recv_task.result()
                     if isinstance(msg, bytes):
-                        # 바이너리는 무시
                         pass
                     else:
                         if msg == "ack:wake_on":
                             print("[server] wake mode on")
                         elif msg == "ack:stt_on":
-                            print("[server] stt mode on")
+                            print("[server] stt mode on (continuous)")
+                        elif msg == "ack:stt_once":
+                            print("[server] stt mode on (single-shot)")
                         elif msg == "event:wake_detected":
-                            print("[server] wake word detected → STT on")
-                            await ws.send("stt_on")
+                            print("[server] wake word detected → STT once")
+                            # 서버가 자동으로 stt_once로 전환하도록 되어 있지만
+                            # 확실히 하려면 아래 줄 유지(중복 harmless)
+                            await ws.send("stt_once")
+                        elif msg == "event:wake_resumed":
+                            print("[server] back to wake mode")
                         elif msg.startswith("result:"):
                             text = msg.split("result:",1)[1]
                             print("[server] STT:", text)
-                            # TODO: 여기서 메인앱으로 전달/액션 수행
+                            # TODO: 메인앱 연동(콜백/큐/소켓 등) 넣으려면 여기에서
+                        elif msg.startswith("err:"):
+                            print("[server]", msg)
                         else:
                             print("[server]", msg)
                 else:
