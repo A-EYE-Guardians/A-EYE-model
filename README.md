@@ -15,7 +15,7 @@ $env:OMP_NUM_THREADS="1"; $env:MKL_NUM_THREADS="1"; $env:KMP_AFFINITY="disabled"
 
 ```
 python .\ver2_gaze_yolo_fusion.py `
-  --eye_cam 1 --world_cam 0 `
+  --eye_cam 2 --world_cam 1 `
   --av_backend_world dshow --pixel_format_world mjpeg `
   --width_world 512 --height_world 384 --fps_world 30 `
   --vda_dir "C:\Gukbi\Direct_RP_CV\Video-Depth-Anything" `
@@ -91,4 +91,20 @@ curl -X POST http://127.0.0.1:9000/nlp/query ^
   -H "Content-Type: application/json" ^
   -d "{\"text\":\"안녕 LangGraph\"}"
 
+```
+
+```
+python audio_forwarder.py --ws ws://127.0.0.1:8000/stream --lg http://127.0.0.1:8010/invoke --session alpha
+```
+
+```stt 실행하며 langgraph 호출
+- cd stt_host
+
+python audio_forwarder.py `
+  --ws ws://127.0.0.1:8000/stream `
+  --mic 4 `
+  --lg http://127.0.0.1:8010/invoke `
+  --session alpha `
+  --lat 37.5665 `
+  --lon 126.9780
 ```
