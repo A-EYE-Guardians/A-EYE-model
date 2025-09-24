@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-ver4_gaze_yolo_fusion.py  (integrated)
+ver5_gaze_yolo_fusion.py
 
 - Eye×World + Video-Depth-Anything(in-proc)
-- 주기적 gaze push + (옵션) 상시 YOLO 전체 프레임 탐지 스트리밍 + (R키) ROI one-shot
-- LangGraph 업링크:
+- 추가(Ver5):
+  1) 상시 전체 YOLO 스트리밍(/detect) + ROI one-shot(R키) 동시 지원
+  2) 런타임 토글: S(스트리밍), O(오버레이), P(LG 업링크) on/off
+  3) HUD에 상태 표시, 오버레이 두께/라벨 최소 conf 옵션
+
+- LangGraph:
     - /perception/gaze/push : 응시 좌표/거리 push(스로틀 0.5s)
     - /image/push           : 프레임 업로드 (filename 반환)
-    - /perception/yolo/push : YOLO 결과 push (bbox=dict{x1,y1,x2,y2}, json=payload)
+    - /perception/yolo/push : YOLO 결과 push (bbox=dict, json=payload)
 - YOLO Docker:
-    - 전체탐지:  POST {yolo_server_url}/detect (이미지 전체)
-    - ROI one-shot: POST {yolo_server_url}/infer  (좌표 주변만)
+    - /detect : 전체 프레임 스트리밍(상시)
+    - /infer  : ROI one-shot (R키)
 """
 
 import os, sys, json, time, math, argparse, contextlib, importlib, importlib.util, types
@@ -326,7 +330,7 @@ def single_cam_dual_iris_step(frame_bgr, face_mesh, ema_L, ema_R,
 
 # ===== YOLO Docker HTTP Client =====
 class YoloDockerClient:
-    """FastAPI 도커 서버(/infer, /detect)."""
+    """FastAPI 도커 서버(/infer, /detect)에 프레임을 보내 추론."""
     def __init__(self, base_url: str, timeout: float = 10.0,
                  default_imgsz: int = 640, default_conf: float = 0.25, default_iou: float = 0.50):
         self.base_url = base_url.rstrip("/")
@@ -342,9 +346,9 @@ class YoloDockerClient:
             raise RuntimeError("JPEG encode failed")
         return buf.tobytes()
 
-    # ROI one-shot (/infer)
     def infer_one(self, bgr, uv: Tuple[int,int], imgsz: Optional[int]=None,
                   conf: Optional[float]=None, iou: Optional[float]=None):
+        """ROI one-shot (/infer)"""
         u, v = int(uv[0]), int(uv[1])
         imgsz = int(imgsz if imgsz is not None else self.default_imgsz)
         conf  = float(conf  if conf  is not None else self.default_conf)
@@ -359,41 +363,37 @@ class YoloDockerClient:
                 print(f"[YOLO/HTTP] HTTP {r.status_code}: {r.text}", flush=True)
                 return None
             resp = r.json()
-            bbox = resp.get("bbox")  # expects {x1,y1,x2,y2}
+            bbox = resp.get("bbox")
             label = resp.get("label")
             confv = resp.get("conf")
-            image_url = resp.get("image_url")
             if not bbox:
                 return None
             return {
                 "bbox": (int(bbox["x1"]), int(bbox["y1"]), int(bbox["x2"]), int(bbox["y2"])),
                 "label": str(label) if label is not None else "object",
                 "conf": float(confv) if confv is not None else 0.0,
-                "image_url": image_url,
             }
         except Exception as e:
             print(f"[YOLO/HTTP] request failed: {e}", flush=True)
             return None
 
-    # 전체 프레임 탐지 (/detect)
-    def detect_full(self, bgr, imgsz: Optional[int]=None, conf: Optional[float]=None, iou: Optional[float]=None) -> Dict[str, Any]:
+    def detect_full(self, bgr, imgsz: Optional[int]=None, conf: Optional[float]=None, iou: Optional[float]=None):
+        """전체 프레임 스트리밍(/detect)"""
         imgsz = int(imgsz if imgsz is not None else self.default_imgsz)
         conf  = float(conf  if conf  is not None else self.default_conf)
         iou   = float(iou   if iou   is not None else self.default_iou)
-        data = {"imgsz": str(imgsz), "conf": str(conf), "iou": str(iou)}
         files = {"file": ("frame.jpg", self._encode_jpeg(bgr), "image/jpeg")}
+        data = {"imgsz": str(imgsz), "conf": str(conf), "iou": str(iou)}
         url = self.base_url + "/detect"
         r = requests.post(url, data=data, files=files, timeout=self.timeout)
         r.raise_for_status()
-        try:
-            return r.json()
-        except Exception:
-            return {"raw": r.text}
+        return r.json()
 
 # ===== LangGraph Client (gaze + image + yolo push) =====
 def _encode_jpeg_bytes(frame, quality: int = 90) -> bytes:
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok: raise RuntimeError("cv2.imencode failed")
+    if not ok:
+        raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
 
 class LGClient:
@@ -404,7 +404,6 @@ class LGClient:
         self.http = requests.Session()
         self._last_push_ts = 0.0
 
-    # --- gaze push (주기 제한) ---
     def push_gaze(self, gaze_xy_norm, focus_dist_m=None, sudden=False, hazards=None, throttle_s=0.5):
         now = time.time()
         if (now - self._last_push_ts) < float(throttle_s):
@@ -427,7 +426,6 @@ class LGClient:
         except Exception as e:
             print("[LG] /perception/gaze/push error:", e, flush=True)
 
-    # --- image push (/image/push) ---
     def push_image(self, jpg_bytes: bytes, ext: str = ".jpg") -> Dict[str, Any]:
         try:
             url = f"{self.base}/image/push"
@@ -440,7 +438,6 @@ class LGClient:
             print("[LG] /image/push error:", e, flush=True)
             return {}
 
-    # --- yolo push (/perception/yolo/push) ---
     def push_yolo(self, width: int, height: int, detections: List[Dict[str, Any]],
                   image_filename: Optional[str] = None, frame_id: Optional[str] = None,
                   ts: Optional[float] = None) -> Dict[str, Any]:
@@ -465,73 +462,39 @@ class LGClient:
             print("[LG] /perception/yolo/push error:", e, flush=True)
             return {}
 
-# ===== YOLO 응답 정규화 (전체 탐지용) =====
-def normalize_full_dets_to_x1y1x2y2(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    다양한 서버 응답을 표준화:
-      1) {"detections":[{"label","bbox":[x,y,w,h] or [x1,y1,x2,y2] or {"x1":..}, "conf":..}, ...]}
-      2) {"result":[{"class_name":..., "xywh":[...], "confidence":...}, ...]}
-      3) {"boxes":[{"cls":"person","x":..,"y":..,"w":..,"h":..,"score":..}, ...]}
-    """
-    out: List[Dict[str, Any]] = []
-
-    def _xywh_to_x1y1x2y2(x, y, w, h):
-        return float(x), float(y), float(x)+float(w), float(y)+float(h)
-
-    if isinstance(raw, dict) and isinstance(raw.get("detections"), list):
-        for d in raw["detections"]:
-            label = d.get("label") or d.get("class") or d.get("cls") or "object"
-            conf = d.get("conf") or d.get("confidence") or d.get("score") or 0.0
-            track_id = d.get("track_id")
-            extra = d.get("extra") or {}
-            bbox = d.get("bbox") or d.get("xywh")
-            x1=y1=x2=y2=None
-            if isinstance(bbox, dict) and all(k in bbox for k in ("x1","y1","x2","y2")):
-                x1,y1,x2,y2 = float(bbox["x1"]), float(bbox["y1"]), float(bbox["x2"]), float(bbox["y2"])
-            elif isinstance(bbox, (list,tuple)) and len(bbox)>=4:
-                # 휴리스틱: [x,y,w,h] 또는 [x1,y1,x2,y2] 판단
-                x,y,w,h = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-                if w>0 and h>0 and (x+w)>=0 and (y+h)>=0:
-                    x1,y1,x2,y2 = _xywh_to_x1y1x2y2(x,y,w,h)
-                else:
-                    x1,y1,x2,y2 = x,y,w,h
-            elif all(k in d for k in ("x","y","w","h")):
-                x1,y1,x2,y2 = _xywh_to_x1y1x2y2(d["x"],d["y"],d["w"],d["h"])
-            if None not in (x1,y1,x2,y2):
-                out.append({"label": str(label),
-                            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                            "conf": float(conf), "track_id": track_id, "extra": extra})
-        return out
-
-    if isinstance(raw, dict) and isinstance(raw.get("result"), list):
-        for d in raw["result"]:
-            label = d.get("class_name") or d.get("label") or "object"
-            xywh = d.get("xywh") or [d.get("x"), d.get("y"), d.get("w"), d.get("h")]
-            conf = d.get("confidence") or d.get("score") or 0.0
-            if xywh and len(xywh)>=4:
-                x1,y1,x2,y2 = _xywh_to_x1y1x2y2(xywh[0],xywh[1],xywh[2],xywh[3])
-                out.append({"label": str(label),
-                            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                            "conf": float(conf), "track_id": d.get("track_id"), "extra": {}})
-        return out
-
-    if isinstance(raw, dict) and isinstance(raw.get("boxes"), list):
-        for d in raw["boxes"]:
-            label = d.get("cls") or d.get("label") or "object"
-            x = d.get("x"); y = d.get("y"); w = d.get("w"); h = d.get("h")
-            conf = d.get("score") or d.get("conf") or 0.0
-            if None not in (x,y,w,h):
-                x1,y1,x2,y2 = _xywh_to_x1y1x2y2(x,y,w,h)
-                out.append({"label": str(label),
-                            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                            "conf": float(conf), "track_id": d.get("id"), "extra": {}})
-        return out
-
-    return out
+# ===== Overlay helper =====
+def _draw_stream_detections(frame_bgr: np.ndarray,
+                            detections: List[Dict[str, Any]],
+                            color=(0, 200, 255),
+                            thickness: int = 2,
+                            label_min_conf: float = 0.25):
+    """스트리밍 /detect 결과 오버레이"""
+    H, W = frame_bgr.shape[:2]
+    for d in detections or []:
+        bbox = d.get("bbox")
+        if not bbox:
+            continue
+        # bbox가 dict(x1,y1,x2,y2) 또는 [x,y,w,h] 모두 처리
+        if isinstance(bbox, dict) and all(k in bbox for k in ("x1","y1","x2","y2")):
+            x1, y1, x2, y2 = int(bbox["x1"]), int(bbox["y1"]), int(bbox["x2"]), int(bbox["y2"])
+        else:
+            try:
+                x, y, w, h = bbox[:4]
+                x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+            except Exception:
+                continue
+        x1 = max(0, min(W-1, x1)); x2 = max(0, min(W-1, x2))
+        y1 = max(0, min(H-1, y1)); y2 = max(0, min(H-1, y2))
+        cv2.rectangle(frame_bgr, (x1,y1), (x2,y2), color, int(thickness))
+        lab = str(d.get("label") or "obj")
+        conf = float(d.get("conf") or 0.0)
+        if conf >= float(label_min_conf):
+            cv2.putText(frame_bgr, f"{lab} {conf:.2f}", (x1, max(16, y1-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
 # ===== Main =====
 def main():
-    ap = argparse.ArgumentParser(description="Eye×World + VDA(in-proc) + YOLO (stream|one-shot)")
+    ap = argparse.ArgumentParser(description="Eye×World + VDA(in-proc) + YOLO stream & ROI one-shot with runtime toggles")
     ap.add_argument("--eye_cam", type=str, required=False, default="0")
     ap.add_argument("--world_cam", type=str, required=True)
 
@@ -578,56 +541,51 @@ def main():
     ap.add_argument("--Kref_h", type=int, default=None, help="intrinsics 기준 height")
 
     # FaceMesh 업데이트율
-    ap.add_argument("--eye_stride", type=int, default=1, help="매 N프레임마다 FaceMesh 실행 (1=매 프레임)")
-
-    # EMA 민첩도
-    ap.add_argument("--ema", type=float, default=0.5, help="EMA alpha (0.3~0.7 권장)")
+    ap.add_argument("--eye_stride", type=int, default=1)
+    ap.add_argument("--ema", type=float, default=0.5)
 
     # 교차 유효성 필터
-    ap.add_argument("--res_max", type=float, default=0.20, help="교차 허용 잔차 상한(미터)")
-    ap.add_argument("--r_min",   type=float, default=0.20, help="광선거리 하한(미터)")
-    ap.add_argument("--draw_rejected", action="store_true", help="거부된 fix도 회색 마커로 표시")
+    ap.add_argument("--res_max", type=float, default=0.20)
+    ap.add_argument("--r_min",   type=float, default=0.20)
+    ap.add_argument("--draw_rejected", action="store_true")
 
-    ap.add_argument("--auto_flip_dir", action="store_true",
-                    help="광선 방향(+d/-d) 둘 다 시도해서 더 좋은 쪽 선택")
+    ap.add_argument("--auto_flip_dir", action="store_true")
 
     # 끄기/중앙 강제/월드 전용
-    ap.add_argument("--disable_gaze", action="store_true",
-                    help="시선 추적 완전히 끔(페이스메시/교차 전부 off), 항상 노란 중앙 십자가")
-    ap.add_argument("--force_center", action="store_true",
-                    help="시선 추적이 켜져 있어도 결과를 무시하고 중앙 십자만 사용")
-    ap.add_argument("--world_only", action="store_true",
-                    help="Eye 카메라/FaceMesh를 아예 열지 않음(자원 절약)")
+    ap.add_argument("--disable_gaze", action="store_true")
+    ap.add_argument("--force_center", action="store_true")
+    ap.add_argument("--world_only", action="store_true")
 
     # 보기 옵션
-    ap.add_argument("--show_eye", action="store_true", help="아이캠 프리뷰 창 표시(Eye (FaceMesh))")
-
-    # 기타
+    ap.add_argument("--show_eye", action="store_true")
     ap.add_argument("--iris_to_eyeball_ratio", type=float, default=2.1)
     ap.add_argument("--show_fps", action="store_true")
     ap.add_argument("--clahe_eye", action="store_true")
     ap.add_argument("--z_tol", type=float, default=0.05)
     ap.add_argument("--t_max", type=float, default=8.0)
     ap.add_argument("--step", type=float, default=0.01)
-    ap.add_argument("--no_gui", action="store_true", help="헤드리스 실행")
+    ap.add_argument("--no_gui", action="store_true")
 
     # === YOLO(도커 서버) 옵션 ===
-    ap.add_argument("--enable_yolo", action="store_true", help="YOLO 기능 사용 (R키 one-shot 및/또는 스트리밍)")
-    ap.add_argument("--yolo_server_url", type=str, default="http://127.0.0.1:8090", help="YOLO FastAPI 서버 베이스 URL")
-    ap.add_argument("--yolo_timeout", type=float, default=10.0, help="YOLO 서버 HTTP 타임아웃(초)")
+    ap.add_argument("--enable_yolo", action="store_true")
+    ap.add_argument("--yolo_server_url", type=str, default="http://127.0.0.1:8090")
+    ap.add_argument("--yolo_timeout", type=float, default=10.0)
     ap.add_argument("--yolo_imgsz", type=int, default=640)
     ap.add_argument("--yolo_conf", type=float, default=0.25)
     ap.add_argument("--yolo_iou", type=float, default=0.50)
 
-    # ★ 상시 전체 프레임 탐지 스트리밍 옵션
-    ap.add_argument("--yolo_stream", action="store_true", help="상시 전체 프레임 객체탐지 스트리밍 on/off")
-    ap.add_argument("--yolo_stream_interval", type=float, default=0.7, help="스트리밍 간격(초)")
-    ap.add_argument("--yolo_stream_min_conf", type=float, default=0.20, help="스트리밍 최소 신뢰도(필터)")
+    # 스트리밍 관련 런타임 토글의 초기값(옵션)
+    ap.add_argument("--yolo_stream", action="store_true", help="프로그램 시작 시 스트리밍 ON")
+    ap.add_argument("--yolo_stream_every", type=int, default=2, help="매 N프레임마다 /detect 호출")
+    ap.add_argument("--yolo_stream_overlay", action="store_true", help="시작 시 오버레이 ON")
+    ap.add_argument("--yolo_stream_push_lg", action="store_true", help="시작 시 LG 업링크 ON")
+    ap.add_argument("--yolo_stream_box_thickness", type=int, default=2)
+    ap.add_argument("--yolo_stream_label_min_conf", type=float, default=0.25)
 
-    # === LangGraph 서버(Perception push) ===
-    ap.add_argument("--lg_url", type=str, default="http://127.0.0.1:8010", help="Wearable LangGraph FastAPI base")
-    ap.add_argument("--lg_session", type=str, default="alpha", help="세션 ID")
-    ap.add_argument("--lg_timeout", type=float, default=4.0, help="LG HTTP 타임아웃(초)")
+    # === LangGraph 서버 ===
+    ap.add_argument("--lg_url", type=str, default="http://127.0.0.1:8010")
+    ap.add_argument("--lg_session", type=str, default="alpha")
+    ap.add_argument("--lg_timeout", type=float, default=4.0)
 
     args = ap.parse_args()
 
@@ -636,15 +594,14 @@ def main():
     if args.disable_gaze: print("[Args] disable_gaze = True → always center cross", flush=True)
     if args.force_center: print("[Args] force_center = True → ignore gaze, center cross", flush=True)
     if args.world_only:   print("[Args] world_only = True → eye camera not opened", flush=True)
-    if args.enable_yolo:
-        print(f"[Args] YOLO ON @ {args.yolo_server_url} | stream={args.yolo_stream} (interval={args.yolo_stream_interval}s) | R=ROI one-shot", flush=True)
+    if args.enable_yolo:  print(f"[Args] YOLO Docker = enabled @ {args.yolo_server_url} (R=ROI one-shot, S/O/P=runtime toggles)", flush=True)
     if args.show_eye and args.no_gui:
         print("[WARN] --show_eye ignored because --no_gui is set", flush=True)
 
     # --- Open cameras ---
     print("[Main] Opening cameras...", flush=True)
 
-    # World cam (항상)
+    # World cam
     read_world, rel_world, flip_world_rt = _open_pyav_or_fallback(
         args.world_cam, av_backend=args.av_backend_world, pixel_format=args.pixel_format_world,
         width=args.width_world, height=args.height_world, fps=args.fps_world,
@@ -653,7 +610,7 @@ def main():
         flip=args.flip_world
     )
 
-    # Eye cam (옵션)
+    # Eye cam
     if args.world_only or args.disable_gaze or args.force_center:
         read_eye = lambda: (False, None)
         def rel_eye(): pass
@@ -708,15 +665,20 @@ def main():
     fx0, fy0, cx0, cy0 = args.fx_w, args.fy_w, args.cx_w, args.cy_w
     warned_k_scale = False
 
-    # YOLO Docker Client 준비
+    # YOLO Docker Client
     yolo_client: Optional[YoloDockerClient] = (
         YoloDockerClient(args.yolo_server_url, timeout=args.yolo_timeout,
                          default_imgsz=args.yolo_imgsz, default_conf=args.yolo_conf, default_iou=args.yolo_iou)
         if args.enable_yolo else None
     )
 
-    # LangGraph Client 준비 (gaze + image/yolo push)
+    # LangGraph Client
     lg = LGClient(args.lg_url, session=args.lg_session, timeout=args.lg_timeout)
+
+    # --- 런타임 토글 상태 ---
+    yolo_stream_on = bool(args.yolo_stream)                 # S키로 토글
+    overlay_on     = bool(args.yolo_stream_overlay)         # O키로 토글
+    pushlg_on      = bool(args.yolo_stream_push_lg)         # P키로 토글
 
     # 루프 준비
     t_last = time.time()
@@ -725,10 +687,7 @@ def main():
     eye_frame_idx = 0
     last_gaze = None
 
-    # ★ 스트리밍 타이머
-    last_stream_t = 0.0
-
-    print("[Main] Entering main loop. Q/ESC to exit. R: YOLO ROI(docker one-shot)", flush=True)
+    print("[Main] Entering main loop. Q/ESC to exit | R: ROI one-shot | S: stream | O: overlay | P: push", flush=True)
     try:
         while True:
             okW, frame_world = read_world()
@@ -736,14 +695,13 @@ def main():
                 time.sleep(0.005); cv2.waitKey(1); continue
             if flip_world_rt: frame_world = cv2.flip(frame_world,1)
 
-            # 오버레이 전 깨끗한 프레임(업링크/YOLO용)
+            # 깨끗한 프레임(업로드/YOLO 전송용)
             frame_world_clean = frame_world.copy()
 
             # Eye 처리
             if (face_mesh is not None) and not (args.disable_gaze or args.force_center):
                 okE, frame_eye = read_eye()
                 if okE and flip_eye_rt: frame_eye = cv2.flip(frame_eye,1)
-
                 run_mesh = (eye_frame_idx % max(1,args.eye_stride) == 0)
                 if run_mesh and okE:
                     draw_eye = (args.show_eye and not args.no_gui)
@@ -766,7 +724,7 @@ def main():
             else:
                 last_gaze = None
 
-            # Depth
+            # World depth
             depth_m = vda.push_and_get(frame_world, min_interval=min_interval)
 
             # Intrinsics scaling
@@ -779,7 +737,7 @@ def main():
                       f"(sx={sx:.3f}, sy={sy:.3f})", flush=True)
                 warned_k_scale = True
 
-            # 표시 좌표(u_fix,v_fix)
+            # Fixation
             hit_txt = "no depth"; drawn = False
             u_fix = int(Wc*0.5); v_fix = int(Hc*0.5)
             Z_d_val = float('nan')
@@ -794,6 +752,7 @@ def main():
                     O_w, d_w, depth_m, fx_eff, fy_eff, cx_eff, cy_eff,
                     t_min=0.1, t_max=args.t_max, step=args.step, patch=7, z_tol=args.z_tol
                 )
+
                 if P_hit is not None and u is not None:
                     u_fix, v_fix = int(u), int(v)
                     Z_d_val = float(Z_d)
@@ -818,7 +777,7 @@ def main():
                 if not args.no_gui:
                     cv2.drawMarker(frame_world, (u_fix,v_fix), (0,255,255), cv2.MARKER_CROSS, 16, 2)
 
-            # ---- Gaze Push ----
+            # Gaze Push (주기 제한)
             try:
                 u_norm = min(max(u_fix / float(Wc), 0.0), 1.0)
                 v_norm = min(max(v_fix / float(Hc), 0.0), 1.0)
@@ -827,90 +786,130 @@ def main():
             except Exception as e:
                 print("[LG] push_gaze exception:", e, flush=True)
 
-            # ---- YOLO 스트리밍 (전체 프레임 탐지) ----
-            if args.enable_yolo and args.yolo_stream:
-                now_t = time.time()
-                if (now_t - last_stream_t) >= max(0.05, float(args.yolo_stream_interval)):
-                    last_stream_t = now_t
-                    try:
-                        # 1) 전체 탐지 호출
-                        raw = yolo_client.detect_full(frame_world_clean, imgsz=args.yolo_imgsz,
-                                                      conf=args.yolo_conf, iou=args.yolo_iou)
-                        dets = normalize_full_dets_to_x1y1x2y2(raw)
-                        # 필터링(선택): 너무 낮은 conf 제거
-                        dets = [d for d in dets if float(d.get("conf", 0.0)) >= float(args.yolo_stream_min_conf)]
-                        # 2) 이미지 업로드
+            # === YOLO 스트리밍 (/detect) ===
+            if args.enable_yolo and yolo_stream_on and (world_frames % max(1, args.yolo_stream_every) == 0):
+                try:
+                    det_resp = yolo_client.detect_full(frame_world_clean,
+                                                       imgsz=args.yolo_imgsz,
+                                                       conf=args.yolo_conf,
+                                                       iou=args.yolo_iou)
+                    stream_dets = det_resp.get("detections", []) or []
+
+                    # 오버레이
+                    if overlay_on and stream_dets and (not args.no_gui):
+                        _draw_stream_detections(frame_world,
+                                                stream_dets,
+                                                color=(0,200,255),
+                                                thickness=int(args.yolo_stream_box_thickness),
+                                                label_min_conf=float(args.yolo_stream_label_min_conf))
+
+                    # LG 업링크(옵션)
+                    if pushlg_on and stream_dets:
+                        dets_for_push = []
+                        for d in stream_dets:
+                            bbox = d.get("bbox")
+                            if not bbox:
+                                continue
+                            # dict or list 모두 허용 → x1y1x2y2로 표준화
+                            if isinstance(bbox, dict) and all(k in bbox for k in ("x1","y1","x2","y2")):
+                                x1,y1,x2,y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
+                            else:
+                                try:
+                                    x,y,w,h = bbox[:4]
+                                    x1,y1,x2,y2 = x, y, x + w, y + h
+                                except Exception:
+                                    continue
+                            dets_for_push.append({
+                                "label": str(d.get("label") or "object"),
+                                "bbox": {"x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)},
+                                "conf": float(d.get("conf") or 0.0),
+                                "track_id": d.get("track_id"),
+                                "extra": {"source": "stream"}
+                            })
+
                         jpg_bytes = _encode_jpeg_bytes(frame_world_clean, quality=90)
                         img_resp = lg.push_image(jpg_bytes, ext=".jpg")
                         filename = img_resp.get("filename") or img_resp.get("data", {}).get("filename")
-                        # 3) YOLO 결과 업링크
-                        yolo_push = lg.push_yolo(width=Wc, height=Hc, detections=dets,
-                                                 image_filename=filename, frame_id=None, ts=now_t)
-                        # (디버그 로그)
-                        kept = yolo_push.get("kept")
-                        print(f"[LG][stream] yolo_push items={len(dets)} kept={kept} file={filename}", flush=True)
-                    except Exception as e:
-                        print("[YOLO/stream] failed:", e, flush=True)
+                        lg.push_yolo(width=Wc, height=Hc, detections=dets_for_push,
+                                     image_filename=filename, frame_id=None, ts=time.time())
+                except Exception as e:
+                    print("[YOLO/stream] error:", e, flush=True)
 
-            # ---- GUI & Hotkeys ----
+            # GUI & Hotkeys
             if not args.no_gui:
                 hud = f"VDA[{args.encoder}{'/metric' if args.metric else ''}] size={args.input_size},max={args.max_res}"
-                cv2.putText(frame_world, hud, (10,24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2, cv2.LINE_AA)
-                cv2.putText(frame_world, hit_txt, (10,50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,0), 2, cv2.LINE_AA)
                 if args.enable_yolo:
-                    mode_txt = "ON" if args.yolo_stream else "OFF"
-                    cv2.putText(frame_world, f"YOLO stream: {mode_txt}  (Press 'R' for ROI one-shot)", (10,76),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0,200,255), 2, cv2.LINE_AA)
-                cv2.imshow("World (VDA + Fixation + YOLO)", frame_world)
+                    hud += f" | YOLO: stream={'ON' if yolo_stream_on else 'OFF'}, overlay={'ON' if overlay_on else 'OFF'}, push={'ON' if pushlg_on else 'OFF'}"
+                cv2.putText(frame_world, hud, (10,24), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0,255,255), 2, cv2.LINE_AA)
+                cv2.putText(frame_world, hit_txt, (10,50), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0,255,0), 2, cv2.LINE_AA)
+                if args.enable_yolo:
+                    cv2.putText(frame_world, "Keys: [R] ROI one-shot, [S] stream, [O] overlay, [P] LG push, [Q] quit",
+                                (10,76), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,200,255), 2, cv2.LINE_AA)
 
+                cv2.imshow("World (VDA in-proc + Fixation + YOLO)", frame_world)
                 k = cv2.waitKey(1) & 0xFF
                 if k in (27, ord('q')):
                     print("[Main] exit key pressed", flush=True)
                     break
+
+                # 런타임 토글
+                elif k in (ord('s'), ord('S')):
+                    yolo_stream_on = not yolo_stream_on
+                    print(f"[YOLO] streaming {'ON' if yolo_stream_on else 'OFF'}", flush=True)
+                elif k in (ord('o'), ord('O')):
+                    overlay_on = not overlay_on
+                    print(f"[YOLO] overlay {'ON' if overlay_on else 'OFF'}", flush=True)
+                elif k in (ord('p'), ord('P')):
+                    pushlg_on = not pushlg_on
+                    print(f"[YOLO] LG push {'ON' if pushlg_on else 'OFF'}", flush=True)
+
+                # ROI one-shot
                 elif args.enable_yolo and (k in (ord('r'), ord('R'))):
-                    # ---- ROI one-shot ----
                     if yolo_client is None:
                         print("[YOLO/HTTP] client not initialized", flush=True)
                     else:
                         out = yolo_client.infer_one(frame_world_clean, (u_fix, v_fix),
                                                     imgsz=args.yolo_imgsz, conf=args.yolo_conf, iou=args.yolo_iou)
                         if out is None:
-                            print(f"[YOLO/HTTP] no box near ({u_fix},{v_fix})", flush=True)
+                            print(f"[YOLO/HTTP] no box found near ({u_fix},{v_fix})", flush=True)
                         else:
                             (x1,y1,x2,y2) = out['bbox']
                             label, confv = out['label'], out['conf']
-                            print(f"[YOLO/HTTP] ROI: {label}({confv:.2f}) bbox=({x1},{y1},{x2},{y2})", flush=True)
+                            print(f"[YOLO/HTTP] Selected: {label}({confv:.2f}) bbox=({x1},{y1},{x2},{y2})", flush=True)
 
                             # draw overlay
-                            cv2.rectangle(frame_world, (x1,y1), (x2,y2), (0,128,255), 2)
-                            cv2.putText(frame_world, f"{label} {confv:.2f}", (x1, max(20,y1-6)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,128,255), 2, cv2.LINE_AA)
-                            cv2.imshow("World (VDA + Fixation + YOLO)", frame_world)
-                            cv2.waitKey(1)
+                            if overlay_on:
+                                cv2.rectangle(frame_world, (x1,y1), (x2,y2), (0,128,255), 2)
+                                cv2.putText(frame_world, f"{label} {confv:.2f}", (x1, max(20,y1-6)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,128,255), 2, cv2.LINE_AA)
+                                cv2.imshow("World (VDA in-proc + Fixation + YOLO)", frame_world)
+                                cv2.waitKey(1)
 
-                            # 업링크 (image + yolo)
+                            # 1) LangGraph 이미지 업로드
                             try:
                                 jpg_bytes = _encode_jpeg_bytes(frame_world_clean, quality=90)
                                 img_resp = lg.push_image(jpg_bytes, ext=".jpg")
                                 filename = img_resp.get("filename") or img_resp.get("data", {}).get("filename")
                             except Exception as e:
                                 filename = None
-                                print("[LG] image upload (ROI) failed:", e, flush=True)
+                                print("[LG] image upload failed:", e, flush=True)
 
+                            # 2) YOLO 결과 push
                             try:
                                 detections = [{
                                     "label": str(label) if label is not None else "object",
-                                    "bbox": {"x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)},
+                                    "bbox": {"x1": float(x1), "y1": float(y1),
+                                             "x2": float(x2), "y2": float(y2)},
                                     "conf": float(confv) if confv is not None else 0.0,
                                     "track_id": None,
-                                    "extra": {"source": "ver4-roi"}
+                                    "extra": {"source": "roi"}
                                 }]
                                 yolo_push = lg.push_yolo(width=Wc, height=Hc, detections=detections,
                                                          image_filename=filename, frame_id=None, ts=time.time())
                                 kept = yolo_push.get("kept")
-                                print(f"[LG][roi] yolo_push ok kept={kept} file={filename}", flush=True)
+                                print(f"[LG] yolo_push ok kept={kept} file={filename}", flush=True)
                             except Exception as e:
-                                print("[LG] yolo push (ROI) failed:", e, flush=True)
+                                print("[LG] yolo push failed:", e, flush=True)
 
             # 1초마다 로그
             now = time.time()
