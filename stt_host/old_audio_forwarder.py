@@ -4,100 +4,11 @@ import websockets
 import sounddevice as sd
 import httpx
 import json
-import os
-import tempfile
-import time
 from typing import Optional
 
-# === [NEW] gTTS + pygame ===
-from gtts import gTTS
-import pygame
-
-# -----------------------------
-# 오디오 캡처 설정 (기존)
-# -----------------------------
 SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_SMP = SAMPLE_RATE * FRAME_MS // 1000  # 320 samples
-
-# -----------------------------
-# [NEW] TTS 재생기 (전역 싱글톤)
-# - 비동기로 합성/재생
-# - 새 요청이 오면 기존 재생 중단
-# -----------------------------
-class AsyncTTSPlayer:
-    _initialized = False
-    _lock = asyncio.Lock()
-    _current_play_id = 0  # 최신 재생 식별자
-
-    @classmethod
-    def _init_if_needed(cls):
-        if not cls._initialized:
-            # pygame mixer 초기화 (기본 오디오 장치)
-            # 주의: 이미 다른 라이브러리로 오디오 캡처 중이어도 문제 없음(출력/입력 분리)
-            pygame.mixer.init()
-            cls._initialized = True
-
-    @classmethod
-    async def speak(cls, text: str, lang: str = "ko", slow: bool = False, debug: bool = True):
-        """gTTS로 합성 후 pygame으로 재생 (비동기, 최신 요청만 유효)"""
-        if not text or not text.strip():
-            return
-
-        # 최신 재생 식별자 채번
-        async with cls._lock:
-            cls._current_play_id += 1
-            play_id = cls._current_play_id
-
-        # 합성은 블로킹이라 스레드로 넘김
-        def synth_to_mp3() -> str:
-            # 임시 mp3 경로
-            fd, path = tempfile.mkstemp(prefix="gtts_", suffix=".mp3")
-            os.close(fd)
-            # gTTS 합성 (gTTS는 온라인 API 사용)
-            t0 = time.time()
-            gTTS(text=text, lang=lang, slow=slow).save(path)
-            if debug:
-                print(f"[gTTS] synth OK ({time.time()-t0:.2f}s) -> {path}")
-            return path
-
-        mp3_path = await asyncio.to_thread(synth_to_mp3)
-
-        # 재생도 블로킹 루프가 있으니 스레드로 처리
-        def play_mp3_blocking(p_id: int, path: str):
-            # 최신 요청만 재생. (뒤늦게 도착한 이전 합성물은 폐기)
-            if p_id != AsyncTTSPlayer._current_play_id:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-                return
-
-            AsyncTTSPlayer._init_if_needed()
-
-            try:
-                # 이전 재생 중단
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
-
-                pygame.mixer.music.load(path)
-                pygame.mixer.music.play()
-
-                # 재생 끝날 때까지 블로킹 루프
-                while pygame.mixer.music.get_busy():
-                    # 재생 중간에 더 새로운 요청이 생기면 즉시 중단
-                    if p_id != AsyncTTSPlayer._current_play_id:
-                        pygame.mixer.music.stop()
-                        break
-                    time.sleep(0.05)
-            finally:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-        await asyncio.to_thread(play_mp3_blocking, play_id, mp3_path)
-
 
 async def ask_langgraph(
     lg_client: httpx.AsyncClient,
@@ -156,7 +67,6 @@ async def ask_langgraph(
 
     return ans or ""
 
-
 async def stream(
     uri: str,
     device_index: Optional[int],
@@ -166,9 +76,6 @@ async def stream(
     api_key: Optional[str],
     lat: Optional[float],
     lon: Optional[float],
-    enable_tts: bool = True,            # [NEW] TTS 사용 on/off
-    tts_lang: str = "ko",               # [NEW] gTTS 언어
-    tts_slow: bool = False,             # [NEW] gTTS 옵션
 ):
     async with websockets.connect(uri, ping_interval=20, max_size=None) as ws:
         print("[host] connect:", uri)
@@ -242,18 +149,15 @@ async def stream(
                                 if langgraph_url and langgraph_client and text:
                                     try:
                                         answer = await ask_langgraph(
-                                            langgraph_client, langgraph_url, text,
-                                            session_id, lat, lon, debug=True
+                                            langgraph_client, langgraph_url, text, session_id, lat, lon, debug=True
                                         )
                                         if answer:
-                                            preview = (answer[:200] + "…") if len(answer) > 200 else answer
-                                            print("[langgraph.answer]", preview)
+                                            print("[langgraph.answer]", (answer[:200] + "…") if len(answer) > 200 else answer)
                                         else:
                                             print("[langgraph.answer] <empty>")
                                     except Exception as e:
                                         print("[langgraph][ERR] exception:", repr(e))
 
-                                # [NEW] 콜백 API 전송 (기존)
                                 if callback_url and callback_client:
                                     try:
                                         cb_payload = {"stt_text": text}
@@ -266,17 +170,9 @@ async def stream(
                                             "Accept": "application/json; charset=utf-8",
                                         }
                                         r = await callback_client.post(callback_url, json=cb_payload, headers=headers)
-                                        out_text = (r.text[:200] + "…") if len(r.text) > 200 else r.text
-                                        print("[main_api]", r.status_code, out_text)
+                                        print("[main_api]", r.status_code, (r.text[:200] + "…") if len(r.text) > 200 else r.text)
                                     except Exception as e:
                                         print("[main_api][ERR]", repr(e))
-
-                                # [NEW] TTS: LangGraph answer를 합성/재생 (비동기 태스크)
-                                if enable_tts and answer:
-                                    asyncio.create_task(
-                                        AsyncTTSPlayer.speak(answer, lang=tts_lang, slow=tts_slow, debug=True)
-                                    )
-
                             elif msg.startswith("err:"):
                                 print("[server]", msg)
                             else:
@@ -295,7 +191,6 @@ async def stream(
             if langgraph_client:
                 await langgraph_client.aclose()
 
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ws", default="ws://127.0.0.1:8000/stream",
@@ -312,12 +207,6 @@ if __name__ == "__main__":
                     help="메인 API 인증용 Bearer 토큰")
     ap.add_argument("--lat", type=float, default=None, help="위도")
     ap.add_argument("--lon", type=float, default=None, help="경도")
-
-    # [NEW] TTS 옵션
-    ap.add_argument("--no-tts", action="store_true", help="TTS 비활성화")
-    ap.add_argument("--tts-lang", default="ko", help="gTTS 언어 코드 (기본 ko)")
-    ap.add_argument("--tts-slow", action="store_true", help="gTTS slow=True")
-
     args = ap.parse_args()
 
     asyncio.run(stream(
@@ -328,8 +217,5 @@ if __name__ == "__main__":
         args.session,
         args.api_key,
         args.lat,
-        args.lon,
-        enable_tts=(not args.no_tts),
-        tts_lang=args.tts_lang,
-        tts_slow=args.tts_slow,
+        args.lon
     ))

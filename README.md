@@ -205,5 +205,68 @@ python audio_forwarder.py `
   --lg http://127.0.0.1:8010/invoke `
   --session alpha `
   --lat 37.5665 `
+  --lon 126.9780 `
+  --no-tts
+```
+
+# ** Final !!최종 실행 방법!!**
+
+### 1. stt 가동
+
+```
+cd C:\Gukbi\Direct_RP_CV\stt_host
+
+python audio_forwarder.py `
+  --ws ws://127.0.0.1:8000/stream `
+  --mic 2 `
+  --lg http://127.0.0.1:8010/invoke `
+  --session alpha `
+  --lat 37.5665 `
   --lon 126.9780
+```
+
+### 2. main (ver4_gaze_yolo_fusion.py) 실행
+
+- 또 다른 powershell 열고 루트에서 실행하기
+
+```
+python .\ver3_gaze_yolo_fusion.py `
+  --eye_cam 2 --world_cam 1 `
+  --av_backend_world dshow --pixel_format_world mjpeg `
+  --width_world 512 --height_world 384 --fps_world 30 `
+  --vda_dir "C:\Gukbi\Direct_RP_CV\Video-Depth-Anything" `
+  --encoder vits --metric --input_size 256 --max_res 640 `
+  --target_fps 18 --device auto `
+  --force_center `
+  --fx_w $($W.fx) --fy_w $($W.fy) --cx_w $($W.cx) --cy_w $($W.cy) `
+  --Kref_w 512 --Kref_h 384 `
+  --extrinsic_json .\data\extrinsic_eye_to_world.json `
+  --enable_yolo `
+  --yolo_server_url "http://127.0.0.1:8090" `
+  --yolo_imgsz 640 --yolo_conf 0.25 --yolo_iou 0.50 `
+  --lg_url "http://127.0.0.1:8010" `
+  --lg_session alpha `
+  --show_fps
+```
+
+```이거는 나중에 홍채 인식 필요하면 켜기
+python .\ver4_gaze_yolo_fusion.py `
+  --eye_cam 1 --world_cam 0 `
+  --av_backend_eye dshow --pixel_format_eye mjpeg `
+  --av_backend_world dshow --pixel_format_world mjpeg `
+  --width_eye 320 --height_eye 240 --fps_eye 30 `
+  --width_world 512 --height_world 384 --fps_world 30 `
+  --vda_dir "C:\Gukbi\Direct_RP_CV\Video-Depth-Anything" `
+  --encoder vits --metric --input_size 256 --max_res 640 `
+  --target_fps 18 --device auto `
+  --fx_w $($W.fx) --fy_w $($W.fy) --cx_w $($W.cx) --cy_w $($W.cy) `
+  --Kref_w 512 --Kref_h 384 `
+  --extrinsic_json .\data\extrinsic_eye_to_world.json `
+  --enable_yolo `
+  --yolo_server_url "http://127.0.0.1:8090" `
+  --yolo_imgsz 640 --yolo_conf 0.25 --yolo_iou 0.50 `
+  --lg_url "http://127.0.0.1:8010" `
+  --lg_session alpha `
+  --show_eye `
+  --show_fps
 ```
