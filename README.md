@@ -13,7 +13,7 @@
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)]()
 
 
-> **빠른 실행 테스트는 4번 "Setup & Run" 항목을 확인해주세요.**
+> **빠른 실행 테스트는 4번 "Setup & Run" 항목을 확인해주세요!**
 </div>
 
 ---
